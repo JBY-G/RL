@@ -1,2 +1,2 @@
 # RL
-DDQN with elite pool strategy.
+DP-DDQN :DDQN with elite pool strategy.
