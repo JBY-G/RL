@@ -1,1 +1,569 @@
+## including port environment and agent #
+print(f"TensorFlow Version: {tf.__version__}")
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        # 打印所有可用的GPU设备
+        for gpu in gpus:
+            print(f"Found GPU: {gpu}")
+        print(f"Number of GPUs Available: {len(gpus)}")
+    except RuntimeError as e:
+        print(e)
+else:
+    print("!!! WARNING: No GPU found by TensorFlow. Running on CPU. !!!")
+print("="*50)
+港口环境 (PortEnv) ---
+class PortEnv:
+    def __init__(self, num_berths, num_cargo_types, data_filepath=None, initial_ship_data_list=None):
+        # 核心修改：允许通过列表直接初始化，而不仅仅是文件路径
+        if initial_ship_data_list:
+            # 深拷贝以确保环境的独立性
+            self.initial_ship_data = copy.deepcopy(initial_ship_data_list)
+        elif data_filepath:
+            # 从文件加载的逻辑保持不变
+            try:
+                fixed_ship_df = pd.read_csv(data_filepath)
+                if 'id' not in fixed_ship_df.columns:
+                    fixed_ship_df['id'] = range(len(fixed_ship_df))
+                self.initial_ship_data = fixed_ship_df.to_dict('records')
+            except FileNotFoundError:
+                raise FileNotFoundError(f"找不到数据文件: {data_filepath}。")
+        else:
+            raise ValueError("必须提供 data_filepath 或 initial_ship_data_list")
 
+        # 为每艘船添加动态状态字段
+        for ship in self.initial_ship_data:
+            ship["status"] = "NOT_ARRIVED"
+            ship["wait_time"] = 0.0
+            ship["service_start_time"] = -1.0
+            ship["service_end_time"] = -1.0
+            ship["assigned_berth"] = -1
+
+        self.num_ships = len(self.initial_ship_data)
+        self.num_berths = num_berths
+        self.num_cargo_types = num_cargo_types
+
+    def reset(self):
+        """
+        重置环境到初始状态。
+        由于数据是固定的，这个函数现在只是重置动态状态，而不是重新生成数据。
+        这部分代码逻辑本身就是正确的，所以无需修改。
+        """
+        self.ship_data = [ship.copy() for ship in self.initial_ship_data]
+
+        self.berth_available_time = np.zeros(self.num_berths)
+        self.current_time = 0.0
+        self.waiting_ships = set()
+        self.servicing_ships = set()
+        self.completed_ships = set()
+        self.total_weighted_waiting_time = 0.0
+        self.cumulative_reward = 0.0
+
+        self.total_actual_berth_processing_time_episode = 0.0
+        # ### 修改点 5: 在 reset 时重置利用率跟踪器 ###
+        self.total_berth_busy_time_episode.fill(0.0)
+
+        self._update_ship_arrivals()
+        self._update_berth_and_ship_status()
+        self.schedule_history = []
+        return self._get_state()
+
+    def _update_ship_arrivals(self):
+        """(内部) 检查并更新到达的船舶状态"""
+        newly_arrived = False
+        for i in range(self.num_ships):
+            ship = self.ship_data[i]
+            if ship['status'] == "NOT_ARRIVED" and ship['arrival_time'] <= self.current_time:
+                ship['status'] = "WAITING"
+                self.waiting_ships.add(i)
+                newly_arrived = True
+        # if newly_arrived:
+        #     print(f"Time {self.current_time:.2f}: Ships arrived. Waiting queue: {list(self.waiting_ships)}")
+
+    def _update_berth_and_ship_status(self):
+        """(内部) 检查并更新完成服务和空闲的泊位"""
+        ships_just_completed = set()
+        for ship_id in list(self.servicing_ships):
+            if self.current_time >= self.ship_data[ship_id]['service_end_time']:
+                berth_id = self.ship_data[ship_id]['assigned_berth']
+                # print(f"Time {self.current_time:.2f}: Ship {ship_id} completed service at berth {berth_id}. Berth now free.")
+                # 泊位在服务结束后才真正空闲
+                self.berth_available_time[berth_id] = self.ship_data[ship_id]['service_end_time']  # 更新泊位可用时间戳
+                self.ship_data[ship_id]['status'] = "COMPLETED"
+                self.servicing_ships.remove(ship_id)
+                self.completed_ships.add(ship_id)
+                ships_just_completed.add(ship_id)
+
+        # 更新等待船舶的等待时间 (用于状态表示和调试)
+        for ship_id in self.waiting_ships:
+            self.ship_data[ship_id]['wait_time'] = max(0.0, self.current_time - self.ship_data[ship_id]['arrival_time'])
+
+        return ships_just_completed
+
+    def _get_state(self):
+        """获取当前环境状态的数值表示"""
+        state = []
+        max_serv_time_norm = self._service_time_mean + 3 * self._service_time_stddev + 1e-6
+
+        # 船舶信息
+        for i in range(self.num_ships):
+            ship = self.ship_data[i]
+            is_waiting = 1.0 if ship['status'] == "WAITING" else 0.0
+            current_wait_time = ship['wait_time']  # 使用已更新的等待时间
+            norm_wait_time = min(current_wait_time / (self.max_time_estimate + 1e-6), 5.0)  # 限制最大值防止极端情况
+            norm_service_time = ship['service_time'] / max_serv_time_norm
+            norm_weight = ship['weight'] / 10.0
+            state.extend([is_waiting, norm_wait_time, norm_service_time, norm_weight])
+
+            # ### 修改点 6: 添加货物类型的 One-Hot 编码到状态中 ###
+            cargo_type_one_hot = np.zeros(self.num_cargo_types)
+            # ship['cargo_type'] 是从1开始的, 数组索引是从0开始的
+            cargo_type_index = ship['cargo_type'] - 1
+            cargo_type_one_hot[cargo_type_index] = 1.0
+            state.extend(cargo_type_one_hot)
+
+        # 泊位信息
+        for berth_id in range(self.num_berths):
+            # is_free 严格定义为 <= 当前时间
+            is_free = 1.0 if self.berth_available_time[berth_id] <= self.current_time else 0.0
+            time_until_free = max(0.0, self.berth_available_time[berth_id] - self.current_time)
+            norm_time_until_free = min(time_until_free / (self.max_time_estimate + 1e-6), 5.0)  # 限制最大值
+            # norm_efficiency = self.berth_efficiency_factors[berth_id] / 2
+            state.extend([is_free, norm_time_until_free])
+
+            # ### 修改点 2: 将该泊位的效率向量添加到状态中 ###
+            # 获取这个泊位对所有货物类型的效率 (一行)
+            efficiency_vector_for_this_berth = self.berth_cargo_efficiency_matrix[berth_id, :]
+
+            # 归一化效率向量
+            normalized_efficiencies = efficiency_vector_for_this_berth / 3
+
+            # 添加到状态向量
+            state.extend(normalized_efficiencies.tolist())  # 使用 tolist() 转换为列表
+
+            # ### 修改点 A: 将实时泊位利用率加入状态 ###
+            # 计算到当前时间点的利用率
+            if self.current_time > 0:
+                current_utilization_rates = self.total_berth_busy_time_episode / self.current_time
+            else:
+                current_utilization_rates = np.zeros(self.num_berths)
+
+            # 将归一化的利用率（0到1之间）加入状态
+            berth_utilization = np.clip(current_utilization_rates[berth_id], 0, 1.0)
+
+            state.extend([berth_utilization])  # <-- 新增 berth_utilization
+
+        # 新增：归一化的等待船舶数量
+
+        norm_num_waiting_ships = len(self.waiting_ships) / (self.num_ships + 1e-6)  # 加小常数防除零
+        state.append(norm_num_waiting_ships)
+        return np.array(state).reshape(1, -1)
+
+    def get_valid_actions_mask(self):
+        """获取有效的动作掩码 (包括等待动作)"""
+        mask = np.zeros(self.action_size, dtype=bool)
+
+        if self.is_done():  # 如果已经结束，没有有效动作
+            return mask
+
+        # 1. 检查有效的分配动作
+        free_berths = [b_id for b_id in range(self.num_berths) if self.berth_available_time[b_id] <= self.current_time]
+        if self.waiting_ships and free_berths:  # 必须有等待的船和空闲的泊位
+            for ship_id in self.waiting_ships:
+                for berth_id in free_berths:
+                    action_index = ship_id * self.num_berths + berth_id
+                    mask[action_index] = True
+
+        # 2. "等待"动作始终有效（除非回合已结束，前面已处理）
+        mask[self.wait_action_index] = True
+
+        return mask
+
+    def advance_time(self):
+        """推进仿真时间到下一个事件点，并更新状态"""
+        next_arrival_time = float('inf')
+        for ship in self.ship_data:
+            if ship['status'] == "NOT_ARRIVED":
+                next_arrival_time = min(next_arrival_time, ship['arrival_time'])
+
+        next_completion_time = float('inf')
+        if self.servicing_ships:
+            # 下一个完成时间是服务结束时间
+            next_completion_time = min(self.ship_data[s_id]['service_end_time'] for s_id in self.servicing_ships)
+
+        # 找出所有未来事件中的最早时间
+        potential_next_times = [t for t in [next_arrival_time, next_completion_time] if t > self.current_time]
+
+        if not potential_next_times:
+            # 没有未来的到达或完成事件
+            if not self.waiting_ships and not self.servicing_ships:
+                # 没有等待，没有服务，没有未来事件 -> 完成
+                return True  # 所有船都完成了
+            elif self.servicing_ships:
+                # 还有船在服务，但完成时间没在列表里？说明完成时间<=当前时间，已在 update_berth 处理
+                # 此时如果没有等待的船，则需要跳到下一个完成时间点
+                actual_next_completion = min(self.ship_data[s_id]['service_end_time'] for s_id in self.servicing_ships)
+                if actual_next_completion > self.current_time:
+                    next_event_time = actual_next_completion
+                else:  # 可能刚好等于当前时间，需要稍微推进避免死循环
+                    next_event_time = self.current_time + 0.001  # 极小推进
+            elif self.waiting_ships:
+                # 有等待的船，但没有未来事件（没有新到达，没有服务完成）
+                # 这意味着所有泊位都被占满且未来完成时间 > 当前时间? (这种情况应该包含在 next_completion_time 里)
+                # 或者泊位都空闲但不能分配？ (不可能)
+                # 可能是所有船都到达且等待，所有服务都完成了。
+                # 此时如果泊位空闲，应该可以分配；如果泊位不空闲，应该有 next_completion_time。
+                # 理论上不应到这里，除非出现逻辑错误。强制结束以防万一。
+                print(
+                    f"Warning: advance_time reached unexpected state at {self.current_time:.2f}. Waiting: {self.waiting_ships}, Servicing: {self.servicing_ships}. Force check done.")
+                return self.is_done()
+
+            else:  # 完成
+                return True
+        else:
+            next_event_time = min(potential_next_times)
+
+        # print(f"Advancing time from {self.current_time:.2f} to {next_event_time:.2f}")
+        self.current_time = next_event_time
+
+        # 更新状态：先处理完成，再处理到达（同一时间点完成优先，泊位先空出来）
+        self._update_berth_and_ship_status()
+        self._update_ship_arrivals()
+
+        return self.is_done()  # 返回是否所有船都完成
+
+    def step(self, action_index):
+        """执行一个动作（分配或等待）"""
+        done = self.is_done()  # 检查开始时是否已结束
+        if done:
+            # 如果尝试在结束后执行步骤，返回0奖励和最终状态
+            return self._get_state(), 0.0, True, {"message": "Episode already ended"}
+
+        info = {"action_type": "unknown"}
+
+        # --- 情况 1: 选择 "等待" 动作 ---
+        if action_index == self.wait_action_index:
+            info["action_type"] = "wait"
+
+            # --- 【新的死锁检测逻辑】 ---
+            # 检查是否处于可能导致死锁的状态
+            all_ships_arrived = all(s['status'] != 'NOT_ARRIVED' for s in self.ship_data)
+            has_waiting_ships = len(self.waiting_ships) > 0
+            has_free_berths = any(
+                self.berth_available_time[b_id] <= self.current_time for b_id in range(self.num_berths))
+
+            # 如果所有船都到了，还有船在等，还有空泊位，但智能体选择了等待 -> 这是个愚蠢的决定
+            if all_ships_arrived and has_waiting_ships and has_free_berths:
+                # 我们可以认为这是一个“放弃治疗”的动作，直接结束回合
+                # 并给予一个巨大的惩罚，让智能体再也不敢这么做
+                reward = -50  # 巨大的固定惩罚
+                self.cumulative_reward += reward
+                print('Huge')
+                # 将 done 标志设为 True，并附上说明
+                info['message'] = 'Terminated due to waiting when assignment was possible at the end.'
+                return self._get_state(), reward, done, info  # 直接结束回合
+            # --- 【死锁检测逻辑结束】 ---
+
+            # 如果不是死锁情况，执行正常的等待惩罚
+            num_free_berths_now = sum(
+                1 for b_id in range(self.num_berths) if self.berth_available_time[b_id] <= self.current_time)
+            reward = -len(self.waiting_ships) * 0.1 - num_free_berths_now * 0.1  # 普通等待惩罚
+            self.cumulative_reward += reward
+            return self._get_state(), reward, done, info
+
+        # --- 情况 2: 选择 "分配" 动作 ---
+        # 此时 action_index 必然是一个有效的分配动作 (由 choose_action 和 mask 保证)
+        ship_id = action_index // self.num_berths
+        berth_id = action_index % self.num_berths
+        info["action_type"] = "assign"
+        info["assigned_ship"] = ship_id
+        info["assigned_berth"] = berth_id
+
+        ship = self.ship_data[ship_id]
+
+        if not (ship['status'] == "WAITING" and self.berth_available_time[berth_id] <= self.current_time):
+            reward = -200
+            self.cumulative_reward += reward
+            return self._get_state(), reward, done, info
+
+        # 获取泊位效率----------------------------
+        # ### 修改点 7: 动态计算服务时间并更新利用率 ##
+        ship_cargo_type = ship['cargo_type']
+        # 从效率矩阵中查找对应的效率因子
+        efficiency = self.berth_cargo_efficiency_matrix[berth_id, ship_cargo_type - 1]  # -1 因为货物类型从1开始
+
+        # 根据效率调整服务时间
+        actual_processing_time_on_berth = ship['service_time'] / efficiency
+
+        # --- 更新泊位利用率跟踪器 ---
+        self.total_berth_busy_time_episode[berth_id] += actual_processing_time_on_berth
+        # 执行分配
+        ship['status'] = "SERVICING"
+        # 服务开始时间是当前决策时间点
+        ship['service_start_time'] = self.current_time
+        ship['service_end_time'] = ship['service_start_time'] + actual_processing_time_on_berth  # 使用调整后的
+        ship['assigned_berth'] = berth_id
+        # 最终等待时间在分配时确定
+        ship['wait_time'] = max(0.0, self.current_time - ship['arrival_time'])
+
+        # 更新泊位占用结束时间
+        self.berth_available_time[berth_id] = ship['service_end_time']
+
+        # 更新跟踪集合
+        self.waiting_ships.remove(ship_id)
+        self.servicing_ships.add(ship_id)
+
+        # --- 记录结束 ---
+        self.schedule_history.append({
+            'ship_id': ship_id,
+            'berth_id': berth_id,
+            'start_time': ship['service_start_time'],  # 实际开始作业时间
+            'end_time': ship['service_end_time'],  # 实际作业结束时间
+            'original_service_time': ship['service_time'],  # 船舶原始所需服务时间
+            'weight': ship['weight']
+        })
+        # 累加实际作业时间-----------------
+        self.total_actual_berth_processing_time_episode += actual_processing_time_on_berth
+
+        efficiency_bonus = (efficiency - 1.0) * 0.5  # 0.5 是一个可调的权重因子
+
+        # 计算奖励 = -(等待时间 * 权重)
+        reward = - (ship['wait_time'] * ship['weight']) * 0.01 + efficiency_bonus
+        self.cumulative_reward += reward
+        self.total_weighted_waiting_time += (ship['wait_time'] * ship['weight'])  # 累加评估指标
+
+        # print(f"Time {self.current_time:.2f}: Assigned Ship {ship_id} (Wait: {ship['wait_time']:.2f}, Weight: {ship['weight']}) to Berth {berth_id}. Service ends at {ship['service_end_time']:.2f}. Reward: {reward:.2f}")
+
+        # 获取分配动作执行后的状态 (时间尚未推进)
+        next_state = self._get_state()
+        # 检查这个分配是否恰好是最后一个需要分配的船，并且分配后所有船都开始服务或完成
+        # done 标志主要由 advance_time 控制，这里假设单步分配不会立即结束整个过程
+        done = self.is_done()  # 再次检查以防万一
+
+        return next_state, reward, done, info
+
+    # ### 修改点 8: 新增一个方法用于获取利用率结果 ###
+
+    def get_berth_utilization_rates(self):
+        """计算并返回每个泊位的利用率"""
+        if self.current_time == 0:
+            return np.zeros(self.num_berths)
+
+        utilization_rates = (self.total_berth_busy_time_episode / self.current_time) * 100
+        return utilization_rates
+
+    def is_done(self):
+        """检查是否所有船都完成了服务"""
+        return len(self.completed_ships) == self.num_ships
+
+    # --- 提供只读属性给外部 ---
+    @property
+    def service_time_mean(self):
+        return self._service_time_mean
+
+    @property
+    def service_time_stddev(self):
+        return self._service_time_stddev
+
+
+# --- 3. DQN 智能体 (DQNAgent) ---
+class DQNAgent:
+    def __init__(self, state_size, action_size, wait_action_index,
+                 memory_capacity=1000,
+                 per_alpha=0.5,
+                 per_beta_start=0.4,
+                 per_beta_frames=1000,
+                 per_epsilon_priority=1e-5,  # 之前是 0.01， TensorFlow 论文中常用 1e-5 或 1e-6
+                 per_abs_err_upper=1.0):
+
+        self.state_size = state_size
+        self.action_size = action_size
+        self.wait_action_index = wait_action_index
+
+        # PER 参数
+        self.memory = SumTree(memory_capacity)  # <--- 这里直接使用导入的 SumTree
+        self.per_alpha = per_alpha
+        self.per_beta = per_beta_start
+        self.beta_increment_per_sampling = (1.0 - per_beta_start) / per_beta_frames
+        self.epsilon_priority = per_epsilon_priority
+        self.abs_err_upper = per_abs_err_upper
+
+        self.gamma = 0.95
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.999
+        self.learning_rate = 0.01
+        self.update_target_freq = 5
+
+        self.model = self._build_model()
+        self.target_model = self._build_model()
+        self.update_target_model()
+
+        self.max_priority = 1.0
+
+    def _build_model(self):
+        """构建 Q 网络模型"""
+        model = Sequential([
+            Dense(256, input_dim=self.state_size, activation='relu'),  # 增加层大小
+            Dense(256, activation='relu'),
+            Dense(256, activation='relu'),  # 再加一层
+            Dense(self.action_size, activation='linear')
+        ])
+        model.compile(loss='mse', optimizer=Adam(learning_rate=self.learning_rate))
+        return model
+
+    def update_target_model(self):
+        """将主模型的权重复制到目标模型"""
+        self.target_model.set_weights(self.model.get_weights())
+
+    def remember(self, state, action_index, reward, next_state, done):
+        """存储经验到回放缓冲区"""
+        priority = self.max_priority
+        self.memory.add(priority, (state, action_index, reward, next_state, done))
+
+    def choose_action(self, state, valid_mask):
+        """根据当前状态和有效动作掩码选择动作 (Epsilon-Greedy)"""
+        valid_indices = np.where(valid_mask)[0]
+
+        if not valid_indices.size:  # 没有有效的动作可选 (理论上不应发生，因为wait总是有效，除非done)
+            # print("Warning: No valid actions found, even wait action!") # 调试用
+            return None  # 表示无法选择动作
+
+        if np.random.rand() <= self.epsilon:
+            # 探索: 从有效动作中随机选择
+            action_index = np.random.choice(valid_indices)
+            # print(f"Explore: Chose action {action_index} from {valid_indices}")
+        else:
+            # 利用: 选择 Q 值最高的有效动作
+            act_values = self.model.predict(state, verbose=0)[0]
+            # 将无效动作的 Q 值设置为极小值
+            masked_act_values = np.where(valid_mask, act_values, -np.inf)
+            action_index = np.argmax(masked_act_values)
+            # print(f"Exploit: Q-values (masked) for valid actions {valid_indices}: {masked_act_values[valid_indices]}. Chose {action_index}")
+
+            # 安全检查 (理论上不需要，但可以保留)
+            # if action_index not in valid_indices:
+            #      print(f"Warning: Argmax selected an invalid action index {action_index} from {valid_indices}. Mask: {valid_mask}. QVals: {act_values}. MaskedQ: {masked_act_values}. Falling back to random choice.")
+            #      action_index = np.random.choice(valid_indices)
+
+        return action_index
+
+    def replay(self, batch_size):
+        """从经验回放缓冲区中采样并训练模型 (DDQN 版本)"""
+        if self.memory.current_size == 0:  # 经验池完全为空
+            return None
+
+            # 修改：如果经验不足 batch_size，则使用所有可用经验
+        actual_batch_size = min(batch_size, self.memory.current_size)
+        if actual_batch_size == 0: return None  # Double check
+
+        minibatch_data = [None] * actual_batch_size
+        tree_indices_for_update = np.empty(actual_batch_size, dtype=np.int32)
+        priorities_for_is = np.empty(actual_batch_size, dtype=np.float32)
+
+        priority_segment = self.memory.total_priority / actual_batch_size  # 使用 actual_batch_size
+        if self.memory.total_priority == 0:  # 防止除零，如果所有优先级都是0 (理论上不会因为epsilon_priority)
+            # print("Warning: Total priority is 0 in replay. Cannot sample by priority.")
+            # 这种情况下，可以考虑随机采样或者直接返回
+            if self.memory.current_size > 0:  # 如果有数据但优先级都是0，则均匀采样
+                indices = np.random.choice(self.memory.current_size, actual_batch_size, replace=False)
+                for i, data_idx in enumerate(indices):
+                    tree_idx = data_idx + self.memory.capacity - 1
+                    minibatch_data[i] = self.memory.data[data_idx]
+                    tree_indices_for_update[i] = tree_idx
+                    priorities_for_is[i] = self.memory.tree_nodes[tree_idx]  # 获取其存储的优先级
+            else:
+                return None
+
+
+        else:  # 按优先级采样
+            for i in range(actual_batch_size):
+                a = priority_segment * i
+                b = priority_segment * (i + 1)
+                sample_value = np.random.uniform(a, b)
+                tree_idx, priority, data = self.memory.get_leaf_by_sample_value(sample_value)
+                minibatch_data[i] = data
+                tree_indices_for_update[i] = tree_idx
+                priorities_for_is[i] = priority
+
+        self.per_beta = np.min([1.0, self.per_beta + self.beta_increment_per_sampling])
+
+        states = np.vstack([d[0][0] for d in minibatch_data])
+        action_indices = np.array([d[1] for d in minibatch_data])
+        rewards = np.array([d[2] for d in minibatch_data])
+        next_states = np.vstack([d[3][0] for d in minibatch_data])
+        dones = np.array([d[4] for d in minibatch_data])
+
+        # IS Weights
+        # 确保 total_priority 不为0，否则 sampling_probabilities 会是 nan/inf
+        current_total_priority = self.memory.total_priority if self.memory.total_priority > 0 else 1e-9
+        sampling_probabilities = priorities_for_is / current_total_priority
+        is_weights = np.power(self.memory.current_size * sampling_probabilities + 1e-9, -self.per_beta)  # 加小量防nan
+        is_weights /= (is_weights.max() + 1e-9)  # 归一化
+
+        # --- DDQN Q值和目标计算 ---
+        q_values_current_for_actions_taken = self.model.predict(states, verbose=0)
+
+        # 1. 使用主网络 (self.model) 预测下一状态的Q值，用于选择动作
+        q_values_next_main = self.model.predict(next_states, verbose=0)
+
+        # 2. 使用目标网络 (self.target_model) 预测下一状态的Q值，用于评估选定动作
+        q_values_next_target = self.target_model.predict(next_states, verbose=0)
+
+        targets_for_fit = np.copy(q_values_current_for_actions_taken)
+        td_errors_abs = np.zeros(actual_batch_size)
+
+        for i in range(actual_batch_size):
+            current_q_for_action_taken = q_values_current_for_actions_taken[i, action_indices[i]]
+            target_q_val = 0
+            if dones[i]:
+                target_q_val = rewards[i]
+            else:
+                # a. 从主网络选择最佳动作的索引
+                best_action_idx = np.argmax(q_values_next_main[i])
+                # b. 使用目标网络评估该动作的 Q 值
+                q_target_for_best_action = q_values_next_target[i, best_action_idx]
+                target_q_val = rewards[i] + self.gamma * q_target_for_best_action
+
+            targets_for_fit[i, action_indices[i]] = target_q_val
+            td_error = target_q_val - current_q_for_action_taken
+            td_errors_abs[i] = np.abs(td_error)
+
+            # 更新 SumTree 中的优先级
+            #   clipped_td_errors = np.clip(td_errors_abs, 0.0, 10.0)
+
+            # 使用被限制后的 TD-error 来计算新优先级
+            new_priorities = np.power(td_errors_abs + self.epsilon_priority, self.per_alpha)
+
+            # --- 【核心修改点】---
+            # 在更新 SumTree 前，对这一批次的优先级进行归一化
+            # 这可以防止 total_priority 无限增长
+            # max_priority_in_batch = np.max(new_priorities)
+            # # if max_priority_in_batch > 1e-6:  # 避免除以零
+            #     # 将批次内的优先级缩放到一个合理的范围，比如 [0, 1] 或 [0, self.max_priority]
+            #     # 这里我们简单地除以最大值
+            new_priorities = new_priorities / 20
+            # else:
+            #     normalized_priorities = new_priorities  # 如果所有优先级都接近0，则不归一化
+
+            for i in range(actual_batch_size):
+                # 使用归一化后的优先级来更新 SumTree
+                self.memory.update_priority(tree_indices_for_update[i], new_priorities[i])
+                # 注意：这里的 self.max_priority 跟踪的是归一化后的最大值，通常是1.0
+                self.max_priority = max(self.max_priority, new_priorities[i])
+
+            # --- 【修改结束】---
+
+            history = self.model.fit(states, targets_for_fit,
+                                     sample_weight=is_weights,
+                                     epochs=1, verbose=0, batch_size=actual_batch_size)
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+        return history.history['loss'][0]  # 返回loss
+
+    def load(self, name):
+        self.model.load_weights(name)
+        self.update_target_model()
+
+    def save(self, name):
+        self.model.save_weights(name)
