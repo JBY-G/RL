@@ -43,6 +43,28 @@ class PortEnv:
         self.num_berths = num_berths
         self.num_cargo_types = num_cargo_types
 
+        # ### 修改点 3: 新增泊位利用率跟踪变量 ###
+        # 存储每个泊位累计的繁忙时间
+        self.total_berth_busy_time_episode = np.zeros(self.num_berths)
+        # # 泊位效率因子 (不变)
+
+        max_ships = 100
+        max_berths = 6
+        max_cargo_types = 3
+        # 状态和动作维度 (不变)
+        self.max_time_estimate = sum(s['service_time'] for s in self.initial_ship_data) + \
+                                 (self.initial_ship_data[-1]['arrival_time'] if self.initial_ship_data else 0)
+        self.state_size = self.max_ships * (4 + self.max_cargo_types) + self.max_berths * (3 + self.max_cargo_types) + 1
+        self.action_size = self.max_ships * self.max_berths + 1
+        self.wait_action_index = self.action_size - 1
+
+        # 归一化统计数据 (不变)
+        self._service_time_mean = np.mean([s['service_time'] for s in self.initial_ship_data])
+        self._service_time_stddev = np.std([s['service_time'] for s in self.initial_ship_data])
+
+        self.schedule_history = []
+        self.total_actual_berth_processing_time_episode = 0.0
+
     def reset(self):
         """
         重置环境到初始状态。
