@@ -1,6 +1,6 @@
 class PortEnv:
     def __init__(self, num_berths, num_cargo_types, data_filepath=None, initial_ship_data_list=None):
-        # 核心修改：允许通过列表直接初始化，而不仅仅是文件路径
+        # 文件路径
         if initial_ship_data_list:
             # 深拷贝以确保环境的独立性
             self.initial_ship_data = copy.deepcopy(initial_ship_data_list)
@@ -46,12 +46,14 @@ class PortEnv:
         # if self.num_berths >= 2:
         #     self.berth_efficiency_factors[0] = 2.0
         #     self.berth_efficiency_factors[1] = 2.0
-
+        max_ships = 100
+        max_berths = 6
+        max_cargo_types = 3
         # 状态和动作维度 (不变)
         self.max_time_estimate = sum(s['service_time'] for s in self.initial_ship_data) + \
                                  (self.initial_ship_data[-1]['arrival_time'] if self.initial_ship_data else 0)
-        self.state_size = self.num_ships * (4 + self.num_cargo_types) + self.num_berths * (3 + self.num_cargo_types) + 1
-        self.action_size = self.num_ships * self.num_berths + 1
+        self.state_size = self.max_ships * (4 + self.max_cargo_types) + self.max_berths * (3 + self.max_cargo_types) + 1
+        self.action_size = self.max_ships * self.max_berths + 1
         self.wait_action_index = self.action_size - 1
 
         # 归一化统计数据 (不变)
@@ -64,8 +66,7 @@ class PortEnv:
     def reset(self):
         """
         重置环境到初始状态。
-        由于数据是固定的，这个函数现在只是重置动态状态，而不是重新生成数据。
-        这部分代码逻辑本身就是正确的，所以无需修改。
+
         """
         self.ship_data = [ship.copy() for ship in self.initial_ship_data]
 
