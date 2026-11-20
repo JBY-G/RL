@@ -42,10 +42,7 @@ class PortEnv:
         # 存储每个泊位累计的繁忙时间
         self.total_berth_busy_time_episode = np.zeros(self.num_berths)
         # # 泊位效率因子 (不变)
-        # self.berth_efficiency_factors = np.ones(self.num_berths)
-        # if self.num_berths >= 2:
-        #     self.berth_efficiency_factors[0] = 2.0
-        #     self.berth_efficiency_factors[1] = 2.0
+
         max_ships = 100
         max_berths = 6
         max_cargo_types = 3
