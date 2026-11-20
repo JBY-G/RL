@@ -43,7 +43,18 @@ class PortEnv:
         self.num_berths = num_berths
         self.num_cargo_types = num_cargo_types
 
-        # ### 修改点 3: 新增泊位利用率跟踪变量 ###
+
+        assert self.berth_cargo_efficiency_matrix.shape == (self.num_berths, self.num_cargo_types), "效率矩阵维度错误!"
+        # 动态变量 (这部分逻辑不变)
+        self.ship_data = None
+        self.berth_available_time = None
+        self.current_time = None
+        self.waiting_ships = None
+        self.servicing_ships = None
+        self.completed_ships = None
+        self.total_weighted_waiting_time = None
+        self.cumulative_reward = None
+        # ### 新增泊位利用率跟踪变量 ###
         # 存储每个泊位累计的繁忙时间
         self.total_berth_busy_time_episode = np.zeros(self.num_berths)
         # # 泊位效率因子 (不变)
