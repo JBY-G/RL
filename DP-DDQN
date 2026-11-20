@@ -15,7 +15,7 @@ print("="*50)
 港口环境 (PortEnv) ---
 class PortEnv:
     def __init__(self, num_berths, num_cargo_types, data_filepath=None, initial_ship_data_list=None):
-        # 核心修改：允许通过列表直接初始化，而不仅仅是文件路径
+        # 文件路径
         if initial_ship_data_list:
             # 深拷贝以确保环境的独立性
             self.initial_ship_data = copy.deepcopy(initial_ship_data_list)
@@ -46,8 +46,7 @@ class PortEnv:
     def reset(self):
         """
         重置环境到初始状态。
-        由于数据是固定的，这个函数现在只是重置动态状态，而不是重新生成数据。
-        这部分代码逻辑本身就是正确的，所以无需修改。
+        
         """
         self.ship_data = [ship.copy() for ship in self.initial_ship_data]
 
@@ -153,7 +152,7 @@ class PortEnv:
 
             state.extend([berth_utilization])  # <-- 新增 berth_utilization
 
-        # 新增：归一化的等待船舶数量
+        # 归一化的等待船舶数量
 
         norm_num_waiting_ships = len(self.waiting_ships) / (self.num_ships + 1e-6)  # 加小常数防除零
         state.append(norm_num_waiting_ships)
@@ -200,7 +199,7 @@ class PortEnv:
                 # 没有等待，没有服务，没有未来事件 -> 完成
                 return True  # 所有船都完成了
             elif self.servicing_ships:
-                # 还有船在服务，但完成时间没在列表里？说明完成时间<=当前时间，已在 update_berth 处理
+                # 还有船在服务，但完成时间没在列表里 说明完成时间<=当前时间，已在 update_berth 处理
                 # 此时如果没有等待的船，则需要跳到下一个完成时间点
                 actual_next_completion = min(self.ship_data[s_id]['service_end_time'] for s_id in self.servicing_ships)
                 if actual_next_completion > self.current_time:
