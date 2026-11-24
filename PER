@@ -224,12 +224,6 @@ class PortEnv:
                 else:  # 可能刚好等于当前时间，需要稍微推进避免死循环
                     next_event_time = self.current_time + 0.001  # 极小推进
             elif self.waiting_ships:
-                # 有等待的船，但没有未来事件（没有新到达，没有服务完成）
-                # 这意味着所有泊位都被占满且未来完成时间 > 当前时间? (这种情况应该包含在 next_completion_time 里)
-                # 或者泊位都空闲但不能分配？ (不可能)
-                # 可能是所有船都到达且等待，所有服务都完成了。
-                # 此时如果泊位空闲，应该可以分配；如果泊位不空闲，应该有 next_completion_time。
-                # 理论上不应到这里，除非出现逻辑错误。强制结束以防万一。
                 print(
                     f"Warning: advance_time reached unexpected state at {self.current_time:.2f}. Waiting: {self.waiting_ships}, Servicing: {self.servicing_ships}. Force check done.")
                 return self.is_done()
